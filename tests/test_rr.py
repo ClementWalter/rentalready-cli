@@ -136,6 +136,64 @@ def test_parse_page_last_page_defaults_to_one_when_unpaginated():
     assert last == 1
 
 
+# -------------------- compute_projection --------------------------- #
+import datetime as _dt
+
+
+@pytest.fixture
+def two_season_monthly():
+    """A property live Jul 2025 → Aug 2026: July matures (14n→24n), August is
+    strong in 2025 (29n) but still filling in 2026 (25n)."""
+    return {
+        (2025, 7): {"net": 1039.0, "nights": 14},   # ramp-up first July
+        (2025, 8): {"net": 3513.0, "nights": 29},
+        (2025, 9): {"net": 900.0, "nights": 15},
+        (2026, 7): {"net": 2457.0, "nights": 24},    # matured July
+        (2026, 8): {"net": 3342.0, "nights": 25},    # still filling
+    }
+
+
+def test_projection_uses_latest_july_not_rampup(two_season_monthly):
+    d = rr.compute_projection(two_season_monthly, _dt.date(2025, 7, 1),
+                              _dt.date(2026, 8, 31), _dt.date(2026, 7, 27), fill=False)
+    july = next(m for m in d["months"] if m["month"] == 7)
+    assert july["year_used"] == 2026
+
+
+def test_projection_sum_drops_first_july(two_season_monthly):
+    # Sep'25 900 + Jul'26 2457 + Aug'26 3342 = 6699 (first July 1039 excluded).
+    d = rr.compute_projection(two_season_monthly, _dt.date(2025, 7, 1),
+                              _dt.date(2026, 8, 31), _dt.date(2026, 7, 27), fill=False)
+    assert d["projected_annual_net"] == 6699.0
+
+
+def test_projection_fill_scales_underbooked_august(two_season_monthly):
+    # Aug'26 25n @ 3342 -> scale to best 29n: 3342/25*29 = 3876.72.
+    d = rr.compute_projection(two_season_monthly, _dt.date(2025, 7, 1),
+                              _dt.date(2026, 8, 31), _dt.date(2026, 7, 27), fill=True)
+    aug = next(m for m in d["months"] if m["month"] == 8)
+    assert aug["net"] == 3876.72
+
+
+def test_projection_fill_leaves_already_peaked_july(two_season_monthly):
+    # July's latest (24n) already exceeds its 2025 (14n), so --fill must not touch it.
+    d = rr.compute_projection(two_season_monthly, _dt.date(2025, 7, 1),
+                              _dt.date(2026, 8, 31), _dt.date(2026, 7, 27), fill=True)
+    july = next(m for m in d["months"] if m["month"] == 7)
+    assert july["filled"] is False
+
+
+def test_projection_naive_trailing_includes_current_month(two_season_monthly):
+    # Trailing 12 mo ending Jul 2026: Aug'25 3513 + Sep'25 900 + Jul'26 2457 = 6870.
+    d = rr.compute_projection(two_season_monthly, _dt.date(2025, 7, 1),
+                              _dt.date(2026, 8, 31), _dt.date(2026, 7, 27), fill=False)
+    assert d["naive_trailing_12mo_net"] == 6870.0
+
+
+def test_parse_ddmmyyyy():
+    assert rr._parse_ddmmyyyy("02/07/2026") == _dt.date(2026, 7, 2)
+
+
 # --------------------------- _fmt_eur ------------------------------ #
 def test_fmt_eur_none_is_dash():
     assert rr._fmt_eur(None) == "—"

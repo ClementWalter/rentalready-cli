@@ -78,6 +78,16 @@ The underlying table paginates at 10 rows/page; the command **follows every
 page automatically** so the full period is returned (the per-row sums reconcile
 exactly with the totals row). The JSON output includes `count` and `pages`.
 
+### `bin/rr projection [--fill]`
+Projected **annual net revenue**. A trailing-12-month sum understates a matured
+year because the property's first season ran at ramp-up prices; instead, for
+each of the 12 calendar months this uses the **most recent year that has data**
+(so Jul/Aug come from the latest season, not the first) and sums them. It also
+prints the naive trailing-12-month figure for comparison. `--fill` scales a
+peak month that is still under-booked (e.g. an August not yet fully booked) from
+its current nightly rate up to the best occupancy that month has historically
+reached, so an in-progress season isn't undercounted.
+
 ### `bin/rr property`
 Property info sheet: name, status, address, owner contact, Wi-Fi name/password,
 entry codes, parking / bins / breaker / water-shutoff locations.

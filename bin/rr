@@ -30,6 +30,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import calendar
 import sys
 import tempfile
 import time
@@ -607,6 +608,34 @@ def _parse_reservations_page(soup) -> tuple[list[dict], dict | None, int]:
     return items, totals, last_page
 
 
+def collect_reservations(client, params: dict, refresh: bool = False) -> dict:
+    """Fetch every reservation for `params`, following all pages.
+
+    The table paginates at 10 rows/page via ?page=N while the totals row is
+    period-wide. The pagination nav is windowed (it only links the *next* page)
+    and an out-of-range page silently clamps back to page 1 — so the reliable
+    stop is "this page repeats ids we've already seen" (the clamp), which lands
+    exactly one page past the last real one.
+    """
+    items: list[dict] = []
+    totals = None
+    seen: set[str] = set()
+    page = 1
+    while page <= 1000:  # runaway guard
+        soup = client.soup("/host_space/reservations/", {**params, "page": page},
+                           ttl=DEFAULT_TTL, refresh=refresh)
+        page_items, page_totals, _ = _parse_reservations_page(soup)
+        if page == 1:
+            totals = page_totals
+        if not page_items or (page > 1 and page_items[0]["id"] in seen):
+            break  # empty, or clamped back to an already-seen page => past the end
+        items.extend(page_items)
+        seen.update(r["id"] for r in page_items)
+        page += 1
+    return {"period": params, "count": len(items), "pages": page - 1,
+            "reservations": items, "totals": totals}
+
+
 @cli.command()
 @click.option("--from", "start", default=None, metavar="YYYY-MM-DD", help="Period start (default: 1st of this month).")
 @click.option("--to", "end", default=None, metavar="YYYY-MM-DD", help="Period end (default: today).")
@@ -631,29 +660,7 @@ def reservations(start, end, platform, refresh, as_json):
             raise click.ClickException(f"Unknown platform '{platform}'. Use: airbnb, booking, hoststay.")
         params["platform"] = PLATFORMS[key]
 
-    # The reservations table is paginated at 10 rows/page via ?page=N, while the
-    # totals row is period-wide. The pagination nav is windowed (it only ever
-    # links the *next* page), and an out-of-range page silently clamps back to
-    # page 1 — so the reliable stop is "this page repeats ids we've already
-    # seen" (the clamp), which lands exactly one page past the last real one.
-    items: list[dict] = []
-    totals = None
-    seen: set[str] = set()
-    page = 1
-    while page <= 1000:  # runaway guard
-        soup = client.soup("/host_space/reservations/", {**params, "page": page},
-                           ttl=DEFAULT_TTL, refresh=refresh)
-        page_items, page_totals, _ = _parse_reservations_page(soup)
-        if page == 1:
-            totals = page_totals
-        if not page_items or (page > 1 and page_items[0]["id"] in seen):
-            break  # empty, or clamped back to an already-seen page => past the end
-        items.extend(page_items)
-        seen.update(r["id"] for r in page_items)
-        page += 1
-
-    data = {"period": params, "count": len(items), "pages": page - 1,
-            "reservations": items, "totals": totals}
+    data = collect_reservations(client, params, refresh)
 
     def render(d):
         click.echo(f"Reservations {d['period']['start_date']} → {d['period']['end_date']}"
@@ -671,6 +678,138 @@ def reservations(start, end, platform, refresh, as_json):
                        f"rental {_fmt_eur(t['rental_revenue'])}   "
                        f"commission {_fmt_eur(t['commission'])}   "
                        f"NET {_fmt_eur(t['net_revenue'])}")
+
+    emit(data, as_json, render)
+
+
+_FR_MONTHS = ["", "jan", "fév", "mar", "avr", "mai", "jun",
+              "jul", "aoû", "sep", "oct", "nov", "déc"]
+
+
+def _month_net(client, y: int, m: int, refresh: bool) -> tuple[float, int]:
+    """Portal net revenue + nights for one calendar month.
+
+    Queried as a single-month range so it reproduces exactly the figure the
+    portal shows for that month (e.g. the overview's 'Revenus nets <mois>').
+    """
+    last = calendar.monthrange(y, m)[1]
+    data = collect_reservations(client, {
+        "start_date": f"{y}-{m:02d}-01", "end_date": f"{y}-{m:02d}-{last:02d}",
+    }, refresh)
+    t = data["totals"] or {}
+    return (t.get("net_revenue") or 0.0), (t.get("nights") or 0)
+
+
+def _parse_ddmmyyyy(s: str) -> date:
+    d, m, y = s.split("/")
+    return date(int(y), int(m), int(d))
+
+
+def compute_projection(monthly: dict, first: date, last: date, today: date,
+                       fill: bool) -> dict:
+    """Pure projection math over a {(year, month): {net, nights}} map.
+
+    For each calendar month, uses the most recent year with data; with `fill`,
+    scales an under-booked latest month up to the best occupancy that month has
+    historically reached. Also computes the naive trailing-12-month sum ending
+    at `today`'s month. No I/O — unit-tested directly.
+    """
+    latest: dict[int, tuple[int, dict]] = {}
+    best_nights: dict[int, int] = {}
+    for (yy, mm), v in monthly.items():
+        if mm not in latest or yy > latest[mm][0]:
+            latest[mm] = (yy, v)
+        best_nights[mm] = max(best_nights.get(mm, 0), v["nights"])
+
+    months_out = []
+    projected_total = 0.0
+    for mm in range(1, 13):
+        if mm not in latest:
+            continue
+        yy, v = latest[mm]
+        net, nights, filled = v["net"], v["nights"], False
+        if fill and nights and best_nights[mm] > nights:
+            net = net / nights * best_nights[mm]
+            nights, filled = best_nights[mm], True
+        projected_total += net
+        months_out.append({"month": mm, "label": _FR_MONTHS[mm], "year_used": yy,
+                           "net": round(net, 2), "nights": nights, "filled": filled})
+
+    naive_total = 0.0
+    ty, tm = today.year, today.month
+    for _ in range(12):
+        v = monthly.get((ty, tm))
+        if v:
+            naive_total += v["net"]
+        tm -= 1
+        if tm == 0:
+            ty, tm = ty - 1, 12
+
+    return {
+        "projected_annual_net": round(projected_total, 2),
+        "naive_trailing_12mo_net": round(naive_total, 2),
+        "uplift": round(projected_total - naive_total, 2),
+        "data_span": {"first": first.isoformat(), "last": last.isoformat()},
+        "months": months_out,
+    }
+
+
+@cli.command()
+@click.option("--fill", is_flag=True,
+              help="Scale an under-booked latest month up to its best historical occupancy.")
+@click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def projection(fill, refresh, as_json):
+    """Projected annual net revenue, using the latest season for every month.
+
+    A trailing-12-month sum understates a matured year because the property's
+    first season (its earliest months) ran at ramp-up prices. This instead
+    takes, for each of the 12 calendar months, the **most recent year that has
+    data** — so peak months (Jul/Aug) come from the latest season, not the
+    first — and sums them. The naive trailing-12-month figure is reported
+    alongside for comparison.
+
+    With --fill, a month whose latest season is still under-booked versus the
+    best occupancy it has historically reached (e.g. an August not yet fully
+    booked) is scaled from its current nightly rate up to that occupancy — so a
+    peak month in progress isn't undercounted just because bookings are still
+    landing.
+    """
+    client = get_client()
+    today = date.today()
+
+    # Discover the data span (incl. already-booked future) from one wide pull.
+    wide = collect_reservations(client, {
+        "start_date": today.replace(year=today.year - 2).isoformat(),
+        "end_date": today.replace(year=today.year + 1).isoformat(),
+    }, refresh)
+    starts = [_parse_ddmmyyyy(r["start_date"]) for r in wide["reservations"]]
+    if not starts:
+        raise click.ClickException("No reservations found to project from.")
+    first, last = min(starts), max(starts)
+
+    # Net per (year, month) across the whole span, from the portal's own totals.
+    monthly: dict[tuple[int, int], dict] = {}
+    y, m = first.year, first.month
+    while (y, m) <= (last.year, last.month):
+        net, nights = _month_net(client, y, m, refresh)
+        monthly[(y, m)] = {"net": net, "nights": nights}
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+
+    data = compute_projection(monthly, first, last, today, fill)
+
+    def render(d):
+        click.echo(f"Yearly revenue projection  (data {d['data_span']['first']} → {d['data_span']['last']})\n")
+        for mo in d["months"]:
+            flag = "  ← filled to best occupancy" if mo.get("filled") else ""
+            click.echo(f"  {mo['label']} {mo['year_used']}   "
+                       f"net {_fmt_eur(mo['net']):>12}   ({mo['nights']}n){flag}")
+        click.echo("  " + "-" * 40)
+        click.echo(f"  PROJECTED ANNUAL NET   {_fmt_eur(d['projected_annual_net'])}")
+        click.echo(f"  naive trailing 12 mo   {_fmt_eur(d['naive_trailing_12mo_net'])}"
+                   f"   (uplift {_fmt_eur(d['uplift'])})")
 
     emit(data, as_json, render)
 

@@ -29,6 +29,8 @@ bin/rr doctor         # diagnostique la résolution de session
 bin/rr overview       # indicateurs du mois (occupation, revenus nets, TJM, invité en cours)
 bin/rr reservations --from 2026-07-01 --to 2026-07-31        # détail financier + totaux
 bin/rr reservations --platform booking --json                # filtre plateforme, sortie JSON
+bin/rr projection     # projection de revenus annuels (saison récente par mois)
+bin/rr projection --fill                                     # extrapole un mois pic sous-réservé
 bin/rr property       # fiche logement (adresse, wifi, codes, parking…)
 bin/rr profile        # profil propriétaire (IBAN/BIC/tél/naissance masqués)
 bin/rr profile --reveal
