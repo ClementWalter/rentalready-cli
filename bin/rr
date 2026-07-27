@@ -32,8 +32,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlencode
 
 import click
 import requests
@@ -46,6 +48,11 @@ log = logging.getLogger("rr")
 
 BASE = "https://pms.rentalready.io"
 CONFIG_PATH = Path.home() / ".config" / "rentalready-cli" / "config.json"
+CACHE_DIR = Path.home() / ".cache" / "rentalready-cli"
+# Owner content changes slowly (a booking lands minutes/hours before check-in),
+# so GET responses are cached on disk. Override with $RR_CACHE_TTL (seconds);
+# any read command takes --refresh to bypass and rewrite the cache.
+DEFAULT_TTL = int(os.environ.get("RR_CACHE_TTL", "21600"))  # 6h
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 
 # Chromium cookie stores this CLI knows how to open, in preference order:
@@ -143,6 +150,33 @@ def save_config(cfg: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Response cache (keyed by path + query, TTL-gated)
+# --------------------------------------------------------------------------- #
+def _cache_file(key: str) -> Path:
+    return CACHE_DIR / (hashlib.sha256(key.encode()).hexdigest() + ".html")
+
+
+def cache_read(key: str, ttl: int) -> str | None:
+    if ttl <= 0:
+        return None
+    path = _cache_file(key)
+    if not path.exists() or (time.time() - path.stat().st_mtime) > ttl:
+        return None
+    try:
+        return path.read_text()
+    except OSError:
+        return None
+
+
+def cache_write(key: str, text: str) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_file(key).write_text(text)
+    except OSError:
+        pass  # cache is best-effort; never fail a read over it
+
+
+# --------------------------------------------------------------------------- #
 # HTTP client
 # --------------------------------------------------------------------------- #
 class RentalReady:
@@ -163,8 +197,21 @@ class RentalReady:
             )
         return r
 
-    def soup(self, path: str, params: dict | None = None) -> BeautifulSoup:
-        return BeautifulSoup(self.get(path, params).text, "lxml")
+    def get_text(self, path: str, params: dict | None = None,
+                 ttl: int = 0, refresh: bool = False) -> str:
+        """GET page text, served from the on-disk cache when fresh."""
+        key = path + "?" + urlencode(sorted((params or {}).items()))
+        if not refresh:
+            cached = cache_read(key, ttl)
+            if cached is not None:
+                return cached
+        text = self.get(path, params).text  # raises on login redirect
+        cache_write(key, text)
+        return text
+
+    def soup(self, path: str, params: dict | None = None,
+             ttl: int = 0, refresh: bool = False) -> BeautifulSoup:
+        return BeautifulSoup(self.get_text(path, params, ttl, refresh), "lxml")
 
     def is_valid(self) -> bool:
         try:
@@ -188,8 +235,14 @@ class RentalReady:
         return None
 
 
-def get_client(require_valid: bool = True) -> RentalReady:
-    """Resolve a session: env override, stored config, else auto-extract."""
+def get_client(require_valid: bool = False) -> RentalReady:
+    """Resolve a session: env override, stored config, else auto-extract.
+
+    A known session (env or stored config) is trusted *lazily* — no validation
+    round-trip — so the common path costs zero extra requests; a stale session
+    surfaces as a friendly login-redirect error on the first real fetch. Only
+    the auto-extraction fallback validates, to pick the right browser.
+    """
     env = os.environ.get("RENTALREADY_SESSIONID")
     if env:
         client = RentalReady(env)
@@ -347,9 +400,12 @@ def doctor(as_json):
     }
     try:
         client = get_client()
-        diag["resolved"] = True
-        diag["source"] = load_config().get("source")
-        diag["property_id"] = client.property_id()
+        if client.is_valid():  # doctor validates for real, unlike the lazy path
+            diag["resolved"] = True
+            diag["source"] = load_config().get("source")
+            diag["property_id"] = client.property_id()
+        else:
+            diag["error"] = "session found but not valid (expired?)"
     except click.ClickException as exc:
         diag["error"] = exc.message
 
@@ -433,11 +489,13 @@ def profile(reveal, as_json):
 
 
 @cli.command()
+@click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON.")
-def overview(as_json):
+def overview(refresh, as_json):
     """Current-month KPIs: occupancy, net revenue, ADR, current stay."""
     client = get_client()
-    text = client.soup("/authentification/host_index/").get_text(" ", strip=True)
+    text = client.soup("/authentification/host_index/",
+                       ttl=DEFAULT_TTL, refresh=refresh).get_text(" ", strip=True)
     text = re.sub(r"\s+", " ", text)
 
     def find(pat, cast=str):
@@ -553,8 +611,9 @@ def _parse_reservations_page(soup) -> tuple[list[dict], dict | None, int]:
 @click.option("--from", "start", default=None, metavar="YYYY-MM-DD", help="Period start (default: 1st of this month).")
 @click.option("--to", "end", default=None, metavar="YYYY-MM-DD", help="Period end (default: today).")
 @click.option("--platform", default=None, help="airbnb | booking | hoststay (default: all).")
+@click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON.")
-def reservations(start, end, platform, as_json):
+def reservations(start, end, platform, refresh, as_json):
     """Reservations with full financial breakdown + period totals.
 
     Columns: rental revenue, commission, cleaning, platform/payment fees,
@@ -582,7 +641,8 @@ def reservations(start, end, platform, as_json):
     seen: set[str] = set()
     page = 1
     while page <= 1000:  # runaway guard
-        soup = client.soup("/host_space/reservations/", {**params, "page": page})
+        soup = client.soup("/host_space/reservations/", {**params, "page": page},
+                           ttl=DEFAULT_TTL, refresh=refresh)
         page_items, page_totals, _ = _parse_reservations_page(soup)
         if page == 1:
             totals = page_totals
@@ -616,14 +676,16 @@ def reservations(start, end, platform, as_json):
 
 
 @cli.command()
+@click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON.")
-def property(as_json):
+def property(refresh, as_json):
     """Property info sheet: address, status, Wi-Fi, entry codes, parking, etc."""
     client = get_client()
     pid = client.property_id()
     if not pid:
         raise click.ClickException("Could not determine the property id.")
-    soup = client.soup(f"/authentification/host_appartement_details/{pid}/")
+    soup = client.soup(f"/authentification/host_appartement_details/{pid}/",
+                       ttl=DEFAULT_TTL, refresh=refresh)
 
     # Every field renders as a .row with a label div (gr-hint2) + value div (gr-body1).
     data = {"property_id": pid, "fields": {}}

@@ -99,6 +99,15 @@ text, `--json` if it returns JSON). Use for surfaces without a typed command:
 Diagnose session resolution: env var, stored config, browser sessions found,
 and the resolved property id.
 
+## Caching
+
+Owner content changes slowly, and the portal is slow (~4 s/request), so
+`overview`, `property` and `reservations` cache their GET responses on disk
+(`~/.cache/rentalready-cli/`, TTL 6 h — override with `$RR_CACHE_TTL` seconds).
+A warm `reservations` over a year drops from ~30 s to ~0.2 s. Pass `--refresh`
+on any of them to bypass and rewrite the cache. `profile`/`whoami` are **never**
+cached — they carry IBAN/BIC/DOB, which must not touch a plaintext cache.
+
 ## What is NOT exposed as a typed command
 
 The **calendar**, **analytics** charts and **guest reviews** are rendered

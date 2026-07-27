@@ -8,3 +8,5 @@ auth.json
 *.html
 *.pdf
 *.csv
+# local response cache
+.cache/

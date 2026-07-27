@@ -49,6 +49,15 @@ tout. La session est stockée en chmod-600 dans
 - Un renvoi vers `/account/login/` = session expirée → reconnecte-toi sur
   `pms.rentalready.io` puis relance `bin/rr login`.
 
+## Cache
+
+Le contenu propriétaire change peu et le portail est lent (~4 s/requête), donc
+`overview`, `property` et `reservations` mettent en cache leurs réponses sur
+disque (`~/.cache/rentalready-cli/`, TTL 6 h — surchargeable par `$RR_CACHE_TTL`
+en secondes). Un `reservations` sur un an passe de ~30 s à ~0,2 s. `--refresh`
+force le rafraîchissement. `profile`/`whoami` ne sont **jamais** mis en cache
+(IBAN/BIC/date de naissance).
+
 ## ⚠️ Données sensibles
 
 `bin/rr profile` expose l'IBAN, le BIC, le téléphone et la date de naissance :
