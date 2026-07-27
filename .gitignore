@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+# never commit captured secrets or downloaded personal data
+config.json
+auth.json
+*.har
+*.html
+*.pdf
+*.csv
