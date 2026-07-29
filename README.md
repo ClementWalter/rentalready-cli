@@ -24,18 +24,18 @@ dans le navigateur que quand la session expire (~14 jours).
 ## Utilisation
 
 ```bash
-bin/rr login          # détecte une session navigateur connectée et la stocke
-bin/rr doctor         # diagnostique la résolution de session
-bin/rr overview       # indicateurs du mois (occupation, revenus nets, TJM, invité en cours)
-bin/rr reservations --from 2026-07-01 --to 2026-07-31        # détail financier + totaux
-bin/rr reservations --platform booking --json                # filtre plateforme, sortie JSON
-bin/rr projection     # projection de revenus annuels (saison récente par mois)
-bin/rr projection --fill                                     # extrapole un mois pic sous-réservé
-bin/rr property       # fiche logement (adresse, wifi, codes, parking…)
-bin/rr profile        # profil propriétaire (IBAN/BIC/tél/naissance masqués)
-bin/rr profile --reveal
-bin/rr whoami
-bin/rr get /authentification/host_calendars/ --text          # échappatoire générique
+rr login          # détecte une session navigateur connectée et la stocke
+rr doctor         # diagnostique la résolution de session
+rr overview       # indicateurs du mois (occupation, revenus nets, TJM, invité en cours)
+rr reservations --from 2026-07-01 --to 2026-07-31        # détail financier + totaux
+rr reservations --platform booking --json                # filtre plateforme, sortie JSON
+rr projection     # projection de revenus annuels (saison récente par mois)
+rr projection --fill                                     # extrapole un mois pic sous-réservé
+rr property       # fiche logement (adresse, wifi, codes, parking…)
+rr profile        # profil propriétaire (IBAN/BIC/tél/naissance masqués)
+rr profile --reveal
+rr whoami
+rr get /authentification/host_calendars/ --text          # échappatoire générique
 ```
 
 Chaque commande de lecture accepte `--json`. `$RENTALREADY_SESSIONID` surcharge
@@ -44,12 +44,12 @@ tout. La session est stockée en chmod-600 dans
 
 ## Authentification
 
-- **`bin/rr login`** — extraction automatique depuis Chrome/Arc/Brave/Edge, la
+- **`rr login`** — extraction automatique depuis Chrome/Arc/Brave/Edge, la
   première session valide gagne.
-- **`bin/rr auth [--sessionid <valeur>]`** — coller le cookie `sessionid`
+- **`rr auth [--sessionid <valeur>]`** — coller le cookie `sessionid`
   (devtools → Application → Cookies → `pms.rentalready.io` → `sessionid`).
 - Un renvoi vers `/account/login/` = session expirée → reconnecte-toi sur
-  `pms.rentalready.io` puis relance `bin/rr login`.
+  `pms.rentalready.io` puis relance `rr login`.
 
 ## Cache
 
@@ -62,13 +62,13 @@ force le rafraîchissement. `profile`/`whoami` ne sont **jamais** mis en cache
 
 ## ⚠️ Données sensibles
 
-`bin/rr profile` expose l'IBAN, le BIC, le téléphone et la date de naissance :
+`rr profile` expose l'IBAN, le BIC, le téléphone et la date de naissance :
 ils sont **masqués par défaut**, `--reveal` les affiche en clair.
 
 ## Ce qui n'est pas typé
 
 Le **calendrier**, les **statistiques** (graphiques Highcharts) et les **avis**
-sont rendus côté client : accessibles via `bin/rr get <path> --text`.
+sont rendus côté client : accessibles via `rr get <path> --text`.
 
 ## Tests
 
