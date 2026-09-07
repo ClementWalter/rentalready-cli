@@ -135,7 +135,37 @@ def iter_sessionids():
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
+
+def _auth_broker(action, payload=None):
+    """Keep credential bodies on pipes and suppress provider errors containing secrets."""
+    import subprocess
+    import json
+    try:
+        result = subprocess.run(
+            ["claudine-secret", "auth", action, "rentalready"],
+            input=json.dumps(payload) if payload is not None else None,
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode not in (0, 3):
+            return None
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict):
+            return None
+        if action == "load" and result.returncode:
+            return None
+        return value
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
 def load_config() -> dict:
+    """Prefer broker pending or vault credentials over a legacy working copy."""
+    if CONFIG_PATH.with_suffix(".auth-pending").exists():
+        return _legacy_config()
+    return _auth_broker("load") or _legacy_config()
+
+
+def _legacy_config() -> dict:
     if CONFIG_PATH.exists():
         try:
             return jsonlib.loads(CONFIG_PATH.read_text())
@@ -146,8 +176,15 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.touch(mode=0o600, exist_ok=True)
+    CONFIG_PATH.chmod(0o600)
     CONFIG_PATH.write_text(jsonlib.dumps(cfg, indent=2))
     CONFIG_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)  # chmod 600 — it holds a session
+    pending = CONFIG_PATH.with_suffix(".auth-pending")
+    if _auth_broker("save", cfg) is None:
+        pending.touch(mode=0o600)
+    else:
+        pending.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -869,6 +906,40 @@ def get_cmd(path, as_json, as_text):
         click.echo(BeautifulSoup(r.text, "lxml").get_text("\n", strip=True))
     else:
         click.echo(r.text)
+
+
+
+@cli.command("auth-status")
+@click.option("--json", "as_json", is_flag=True, help="Emit secret-free metadata.")
+def auth_status(as_json):
+    """Report credential storage without contacting the provider. Example: auth-status --json."""
+    import json
+    metadata = _auth_broker("status") or {
+        "connector": "rentalready", "account": "default", "source": "unavailable",
+        "configured": False, "pending": False, "last_sync": None,
+    }
+    if not metadata.get("configured") and CONFIG_PATH.exists():
+        metadata.update(source="legacy", configured=True)
+    metadata.update(session_scope="portable")
+    if CONFIG_PATH.with_suffix(".auth-pending").exists():
+        metadata.update(source="pending-local", configured=True, pending=True)
+    click.echo(json.dumps(metadata))
+
+
+@cli.command("auth-sync")
+def auth_sync():
+    """Move stored credentials into 1Password. Example: auth-sync."""
+    import json
+    local_pending = CONFIG_PATH.with_suffix(".auth-pending")
+    metadata = _auth_broker("save", _legacy_config()) if local_pending.exists() else _auth_broker("sync")
+    if metadata and local_pending.exists():
+        local_pending.unlink()
+    if not metadata or not metadata.get("configured"):
+        config = load_config()
+        metadata = _auth_broker("save", config) if config else metadata
+    click.echo(json.dumps(metadata or {"connector": "rentalready", "source": "unavailable", "pending": False}))
+    if not metadata or not metadata.get("configured") or metadata.get("pending"):
+        raise click.exceptions.Exit(3)
 
 
 if __name__ == "__main__":
