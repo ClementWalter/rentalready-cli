@@ -742,6 +742,56 @@ def _parse_ddmmyyyy(s: str) -> date:
     return date(int(y), int(m), int(d))
 
 
+def _collect_monthly(client, today: date, refresh: bool
+                     ) -> tuple[dict[tuple[int, int], dict], date, date]:
+    """Net + nights per (year, month) over the property's whole booking span.
+
+    The span (incl. already-booked future stays) is discovered from one wide
+    pull; each month is then read from the portal's own single-month totals.
+    """
+    wide = collect_reservations(client, {
+        "start_date": today.replace(year=today.year - 2).isoformat(),
+        "end_date": today.replace(year=today.year + 1).isoformat(),
+    }, refresh)
+    starts = [_parse_ddmmyyyy(r["start_date"]) for r in wide["reservations"]]
+    if not starts:
+        raise click.ClickException("No reservations found.")
+    first, last = min(starts), max(starts)
+
+    monthly: dict[tuple[int, int], dict] = {}
+    y, m = first.year, first.month
+    while (y, m) <= (last.year, last.month):
+        net, nights = _month_net(client, y, m, refresh)
+        monthly[(y, m)] = {"net": net, "nights": nights}
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    return monthly, first, last
+
+
+def compute_monthly_table(monthly: dict) -> dict:
+    """Pivot a {(year, month): {net, nights}} map into month rows × year columns.
+
+    A month outside the booking span is None (rendered as a dash), not 0, so
+    "no data yet" stays distinct from "booked but earned nothing". No I/O.
+    """
+    years = sorted({yy for yy, _ in monthly})
+    rows = []
+    for mm in range(1, 13):
+        cells = {}
+        for yy in years:
+            v = monthly.get((yy, mm))
+            cells[str(yy)] = None if v is None else {"net": round(v["net"], 2),
+                                                     "nights": v["nights"]}
+        rows.append({"month": mm, "label": _FR_MONTHS[mm], "years": cells})
+    totals = {
+        str(yy): {"net": round(sum(v["net"] for (y2, _), v in monthly.items() if y2 == yy), 2),
+                  "nights": sum(v["nights"] for (y2, _), v in monthly.items() if y2 == yy)}
+        for yy in years
+    }
+    return {"years": [str(yy) for yy in years], "months": rows, "totals": totals}
+
+
 def compute_projection(monthly: dict, first: date, last: date, today: date,
                        fill: bool) -> dict:
     """Pure projection math over a {(year, month): {net, nights}} map.
@@ -792,6 +842,40 @@ def compute_projection(monthly: dict, first: date, last: date, today: date,
 
 
 @cli.command()
+@click.option("--nights", "show_nights", is_flag=True, help="Show booked nights next to each amount.")
+@click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def monthly(show_nights, refresh, as_json):
+    """Net revenue per month: one row per month, one column per year.
+
+    Covers the property's whole booking span, already-booked future stays
+    included, so the current and upcoming months may still be filling.
+    """
+    client = get_client()
+    data = compute_monthly_table(_collect_monthly(client, date.today(), refresh)[0])
+
+    # Wide enough for "13 617.79" and, with --nights, "13 617.79 (247n)".
+    w = 17 if show_nights else 10
+
+    def cell(c):
+        if c is None:
+            return f"{'—':>{w}}"
+        text = f"{c['net']:,.2f}".replace(",", " ")
+        if show_nights:
+            text += f" ({c['nights']}n)"
+        return f"{text:>{w}}"
+
+    def render(d):
+        click.echo("      " + "  ".join(f"{y:>{w}}" for y in d["years"]))
+        for row in d["months"]:
+            click.echo(f"{row['label']:6}" + "  ".join(cell(row["years"][y]) for y in d["years"]))
+        click.echo("-" * (6 + (w + 2) * len(d["years"]) - 2))
+        click.echo(f"{'total':6}" + "  ".join(cell(d["totals"][y]) for y in d["years"]))
+
+    emit(data, as_json, render)
+
+
+@cli.command()
 @click.option("--fill", is_flag=True,
               help="Scale an under-booked latest month up to its best historical occupancy.")
 @click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
@@ -814,27 +898,7 @@ def projection(fill, refresh, as_json):
     """
     client = get_client()
     today = date.today()
-
-    # Discover the data span (incl. already-booked future) from one wide pull.
-    wide = collect_reservations(client, {
-        "start_date": today.replace(year=today.year - 2).isoformat(),
-        "end_date": today.replace(year=today.year + 1).isoformat(),
-    }, refresh)
-    starts = [_parse_ddmmyyyy(r["start_date"]) for r in wide["reservations"]]
-    if not starts:
-        raise click.ClickException("No reservations found to project from.")
-    first, last = min(starts), max(starts)
-
-    # Net per (year, month) across the whole span, from the portal's own totals.
-    monthly: dict[tuple[int, int], dict] = {}
-    y, m = first.year, first.month
-    while (y, m) <= (last.year, last.month):
-        net, nights = _month_net(client, y, m, refresh)
-        monthly[(y, m)] = {"net": net, "nights": nights}
-        m += 1
-        if m == 13:
-            y, m = y + 1, 1
-
+    monthly, first, last = _collect_monthly(client, today, refresh)
     data = compute_projection(monthly, first, last, today, fill)
 
     def render(d):

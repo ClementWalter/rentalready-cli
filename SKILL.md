@@ -85,6 +85,14 @@ The underlying table paginates at 10 rows/page; the command **follows every
 page automatically** so the full period is returned (the per-row sums reconcile
 exactly with the totals row). The JSON output includes `count` and `pages`.
 
+### `rr monthly [--nights]`
+Net revenue **per month as a table: one row per month, one column per year**,
+plus a total per year, over the property's whole booking span (already-booked
+future stays included, so the current and upcoming months may still be
+filling). A month with no data shows `—`. `--nights` adds booked nights next to
+each amount. Figures are the portal's own single-month totals, the same ones
+`projection` uses.
+
 ### `rr projection [--fill]`
 Projected **annual net revenue**. A trailing-12-month sum understates a matured
 year because the property's first season ran at ramp-up prices; instead, for

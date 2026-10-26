@@ -190,6 +190,36 @@ def test_projection_naive_trailing_includes_current_month(two_season_monthly):
     assert d["naive_trailing_12mo_net"] == 6870.0
 
 
+# -------------------- compute_monthly_table ------------------------ #
+def test_monthly_table_years_are_columns(two_season_monthly):
+    assert rr.compute_monthly_table(two_season_monthly)["years"] == ["2025", "2026"]
+
+
+def test_monthly_table_has_twelve_month_rows(two_season_monthly):
+    assert len(rr.compute_monthly_table(two_season_monthly)["months"]) == 12
+
+
+def test_monthly_table_cell_holds_net(two_season_monthly):
+    july = rr.compute_monthly_table(two_season_monthly)["months"][6]
+    assert july["years"]["2026"]["net"] == 2457.0
+
+
+def test_monthly_table_month_without_data_is_none(two_season_monthly):
+    # September 2026 is outside the span: no data, not a zero.
+    sep = rr.compute_monthly_table(two_season_monthly)["months"][8]
+    assert sep["years"]["2026"] is None
+
+
+def test_monthly_table_year_total_net(two_season_monthly):
+    # 2025: 1039 + 3513 + 900 = 5452.
+    assert rr.compute_monthly_table(two_season_monthly)["totals"]["2025"]["net"] == 5452.0
+
+
+def test_monthly_table_year_total_nights(two_season_monthly):
+    # 2026: 24 + 25 = 49.
+    assert rr.compute_monthly_table(two_season_monthly)["totals"]["2026"]["nights"] == 49
+
+
 def test_parse_ddmmyyyy():
     assert rr._parse_ddmmyyyy("02/07/2026") == _dt.date(2026, 7, 2)
 

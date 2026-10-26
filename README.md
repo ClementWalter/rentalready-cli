@@ -29,6 +29,8 @@ rr doctor         # diagnostique la résolution de session
 rr overview       # indicateurs du mois (occupation, revenus nets, TJM, invité en cours)
 rr reservations --from 2026-07-01 --to 2026-07-31        # détail financier + totaux
 rr reservations --platform booking --json                # filtre plateforme, sortie JSON
+rr monthly        # revenus nets par mois : une ligne par mois, une colonne par année
+rr monthly --nights                                      # + nuits réservées
 rr projection     # projection de revenus annuels (saison récente par mois)
 rr projection --fill                                     # extrapole un mois pic sous-réservé
 rr property       # fiche logement (adresse, wifi, codes, parking…)
