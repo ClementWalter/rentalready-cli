@@ -1,4 +1,19 @@
-"""Unit tests for the pure parsing helpers in `bin/rr`.
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "click==8.3.3",
+#     "requests==2.34.2",
+#     "beautifulsoup4==4.15.0",
+#     "lxml==6.1.3",
+#     "pycryptodome==4.2.0",
+#     "pytest==9.1.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
+"""Unit tests for the pure parsing helpers in `rentalready_cli.py`.
 
 These cover the fragile bits — French money parsing, secret masking, platform
 mapping, and the reservation table row/detail parsing — against the exact
@@ -12,9 +27,9 @@ from pathlib import Path
 import pytest
 from bs4 import BeautifulSoup
 
-# The CLI lives at bin/rr (no .py extension); load it as a module by path.
+# Load the CLI script as a module by path.
 _SPEC = importlib.util.spec_from_loader(
-    "rr", importlib.machinery.SourceFileLoader("rr", str(Path(__file__).parent.parent / "bin" / "rr"))
+    "rr", importlib.machinery.SourceFileLoader("rr", str(Path(__file__).parent.parent / "rentalready_cli.py"))
 )
 rr = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(rr)
@@ -231,3 +246,7 @@ def test_fmt_eur_none_is_dash():
 
 def test_fmt_eur_formats_thousands():
     assert rr._fmt_eur(2457.02) == "2 457.02 €"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))
