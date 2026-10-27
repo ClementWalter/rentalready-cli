@@ -1,0 +1,1019 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "click==8.3.3",
+#     "requests==2.34.2",
+#     "beautifulsoup4==4.15.0",
+#     "lxml==6.1.3",
+#     "pycryptodome==4.2.0",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
+"""rentalready-cli — read your RentalReady *owner* (host space) content from the
+terminal, acting as the logged-in owner via the browser `sessionid` cookie.
+
+RentalReady's owner portal (`pms.rentalready.io`) is a server-rendered Django
+app protected by a two-factor session login; there is no owner-facing JSON API
+(the `/api/v*` DRF endpoints are manager-only and return 403 for the owner
+role). So this tool authenticates exactly like the owner's browser — with the
+Django `sessionid` cookie — and parses the host-space HTML into structured data.
+
+The session cookie is read straight from a locally logged-in Chromium browser
+(Chrome/Arc/Brave/Edge) by decrypting its cookie store with the app's macOS
+keychain key — the same trick notion-cli uses — so there is nothing to paste and
+no need to re-implement the 2FA login flow. `RENTALREADY_SESSIONID` overrides.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json as jsonlib
+import logging
+import os
+import re
+import shutil
+import sqlite3
+import stat
+import subprocess
+import calendar
+import sys
+import tempfile
+import time
+from datetime import date
+from pathlib import Path
+from urllib.parse import urlencode
+
+import click
+import requests
+from bs4 import BeautifulSoup
+from Crypto.Cipher import AES
+from Crypto.Protocol.KDF import PBKDF2
+
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
+log = logging.getLogger("rr")
+
+BASE = "https://pms.rentalready.io"
+CONFIG_PATH = Path.home() / ".config" / "rentalready-cli" / "config.json"
+CACHE_DIR = Path.home() / ".cache" / "rentalready-cli"
+# Owner content changes slowly (a booking lands minutes/hours before check-in),
+# so GET responses are cached on disk. Override with $RR_CACHE_TTL (seconds);
+# any read command takes --refresh to bypass and rewrite the cache.
+DEFAULT_TTL = int(os.environ.get("RR_CACHE_TTL", "21600"))  # 6h
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+
+# Chromium cookie stores this CLI knows how to open, in preference order:
+# (label, cookie sqlite path, keychain service holding the AES key)
+COOKIE_SOURCES = [
+    ("chrome", "~/Library/Application Support/Google/Chrome/Default/Cookies", "Chrome Safe Storage"),
+    ("chrome", "~/Library/Application Support/Google/Chrome/Profile 1/Cookies", "Chrome Safe Storage"),
+    ("chrome", "~/Library/Application Support/Google/Chrome/Profile 2/Cookies", "Chrome Safe Storage"),
+    ("arc", "~/Library/Application Support/Arc/User Data/Default/Cookies", "Arc Safe Storage"),
+    ("brave", "~/Library/Application Support/BraveSoftware/Brave-Browser/Default/Cookies", "Brave Safe Storage"),
+    ("edge", "~/Library/Application Support/Microsoft Edge/Default/Cookies", "Microsoft Edge Safe Storage"),
+]
+
+
+# --------------------------------------------------------------------------- #
+# Cookie extraction (decrypt a Chromium `v10` cookie with the keychain key)
+# --------------------------------------------------------------------------- #
+def _keychain_key(service: str) -> bytes | None:
+    """Derive the AES key Chromium uses on macOS: PBKDF2(keychain secret)."""
+    try:
+        proc = subprocess.run(
+            ["security", "find-generic-password", "-w", "-s", service],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    secret = proc.stdout.strip().encode()
+    return PBKDF2(secret, b"saltysalt", 16, count=1003,
+                 prf=lambda p, s: hmac.new(p, s, hashlib.sha1).digest())
+
+
+def _decrypt_cookie(encrypted: bytes, key: bytes) -> str | None:
+    """Decrypt a Chromium `v10`/`v11` AES-CBC cookie value."""
+    if not encrypted or encrypted[:3] not in (b"v10", b"v11"):
+        return None
+    try:
+        cipher = AES.new(key, AES.MODE_CBC, iv=b" " * 16)
+        dec = cipher.decrypt(encrypted[3:])
+        dec = dec[: -dec[-1]]  # strip PKCS7 padding
+        try:
+            return dec.decode()
+        except UnicodeDecodeError:
+            # Chrome >= M118 prefixes a 32-byte sha256(domain); skip it.
+            return dec[32:].decode(errors="replace")
+    except (ValueError, IndexError):
+        return None
+
+
+def iter_sessionids():
+    """Yield (source_label, sessionid) from every local Chromium cookie store
+    that holds a `pms.rentalready.io` session cookie."""
+    for label, path, service in COOKIE_SOURCES:
+        store = Path(path).expanduser()
+        if not store.exists():
+            continue
+        key = _keychain_key(service)
+        if not key:
+            continue
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td) / "Cookies"
+            try:
+                shutil.copy2(store, tmp)  # copy: the live DB is locked by the browser
+                con = sqlite3.connect(f"file:{tmp}?immutable=1", uri=True)
+                rows = con.execute(
+                    "SELECT encrypted_value FROM cookies "
+                    "WHERE host_key LIKE '%rentalready.io' AND name='sessionid'"
+                ).fetchall()
+                con.close()
+            except (OSError, sqlite3.Error):
+                continue
+        for (enc,) in rows:
+            val = _decrypt_cookie(bytes(enc), key)
+            if val:
+                yield label, val
+
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+def _auth_broker(action, payload=None):
+    """Keep credential bodies on pipes and suppress provider errors containing secrets."""
+    import subprocess
+    import json
+    try:
+        result = subprocess.run(
+            ["claudine-secret", "auth", action, "rentalready"],
+            input=json.dumps(payload) if payload is not None else None,
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode not in (0, 3):
+            return None
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict):
+            return None
+        if action == "load" and result.returncode:
+            return None
+        return value
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def load_config() -> dict:
+    """Prefer broker pending or vault credentials over a legacy working copy."""
+    if CONFIG_PATH.with_suffix(".auth-pending").exists():
+        return _legacy_config()
+    return _auth_broker("load") or _legacy_config()
+
+
+def _legacy_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return jsonlib.loads(CONFIG_PATH.read_text())
+        except (OSError, ValueError):
+            return {}
+    return {}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.touch(mode=0o600, exist_ok=True)
+    CONFIG_PATH.chmod(0o600)
+    CONFIG_PATH.write_text(jsonlib.dumps(cfg, indent=2))
+    CONFIG_PATH.chmod(stat.S_IRUSR | stat.S_IWUSR)  # chmod 600 — it holds a session
+    pending = CONFIG_PATH.with_suffix(".auth-pending")
+    if _auth_broker("save", cfg) is None:
+        pending.touch(mode=0o600)
+    else:
+        pending.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------------------- #
+# Response cache (keyed by path + query, TTL-gated)
+# --------------------------------------------------------------------------- #
+def _cache_file(key: str) -> Path:
+    return CACHE_DIR / (hashlib.sha256(key.encode()).hexdigest() + ".html")
+
+
+def cache_read(key: str, ttl: int) -> str | None:
+    if ttl <= 0:
+        return None
+    path = _cache_file(key)
+    if not path.exists() or (time.time() - path.stat().st_mtime) > ttl:
+        return None
+    try:
+        return path.read_text()
+    except OSError:
+        return None
+
+
+def cache_write(key: str, text: str) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_file(key).write_text(text)
+    except OSError:
+        pass  # cache is best-effort; never fail a read over it
+
+
+# --------------------------------------------------------------------------- #
+# HTTP client
+# --------------------------------------------------------------------------- #
+class RentalReady:
+    """Owner-scoped RentalReady client: session cookie in, parsed content out."""
+
+    def __init__(self, sessionid: str):
+        self.s = requests.Session()
+        self.s.headers["User-Agent"] = UA
+        self.s.cookies.set("sessionid", sessionid, domain="pms.rentalready.io")
+        self._sessionid = sessionid
+
+    def get(self, path: str, params: dict | None = None) -> requests.Response:
+        r = self.s.get(BASE + path, params=params, allow_redirects=True, timeout=45)
+        if r.url.endswith("/account/login/") or "/account/login/?" in r.url:
+            raise click.ClickException(
+                "Session expired or not logged in. Log into the owner portal in "
+                "your browser (pms.rentalready.io), then re-run `rr login`."
+            )
+        return r
+
+    def get_text(self, path: str, params: dict | None = None,
+                 ttl: int = 0, refresh: bool = False) -> str:
+        """GET page text, served from the on-disk cache when fresh."""
+        key = path + "?" + urlencode(sorted((params or {}).items()))
+        if not refresh:
+            cached = cache_read(key, ttl)
+            if cached is not None:
+                return cached
+        text = self.get(path, params).text  # raises on login redirect
+        cache_write(key, text)
+        return text
+
+    def soup(self, path: str, params: dict | None = None,
+             ttl: int = 0, refresh: bool = False) -> BeautifulSoup:
+        return BeautifulSoup(self.get_text(path, params, ttl, refresh), "lxml")
+
+    def is_valid(self) -> bool:
+        try:
+            r = self.s.get(BASE + "/authentification/host_index/",
+                          allow_redirects=False, timeout=30)
+        except requests.RequestException:
+            return False
+        return r.status_code == 200
+
+    def property_id(self) -> str | None:
+        """The owner's apartment id, discovered from the sidebar nav (cached)."""
+        cfg = load_config()
+        if cfg.get("property_id"):
+            return cfg["property_id"]
+        html = self.get("/authentification/host_index/").text
+        m = re.search(r"/authentification/host_appartement_details/(\d+)/", html)
+        if m:
+            cfg["property_id"] = m.group(1)
+            save_config(cfg)
+            return m.group(1)
+        return None
+
+
+def get_client(require_valid: bool = False) -> RentalReady:
+    """Resolve a session: env override, stored config, else auto-extract.
+
+    A known session (env or stored config) is trusted *lazily* — no validation
+    round-trip — so the common path costs zero extra requests; a stale session
+    surfaces as a friendly login-redirect error on the first real fetch. Only
+    the auto-extraction fallback validates, to pick the right browser.
+    """
+    env = os.environ.get("RENTALREADY_SESSIONID")
+    if env:
+        client = RentalReady(env)
+        if not require_valid or client.is_valid():
+            return client
+        raise click.ClickException("RENTALREADY_SESSIONID is set but not valid.")
+
+    cfg = load_config()
+    if cfg.get("sessionid"):
+        client = RentalReady(cfg["sessionid"])
+        if not require_valid or client.is_valid():
+            return client
+
+    # Fall back to auto-extraction from a logged-in browser.
+    for label, sid in iter_sessionids():
+        client = RentalReady(sid)
+        if client.is_valid():
+            cfg["sessionid"] = sid
+            cfg["source"] = label
+            save_config(cfg)
+            log.info("Using session from %s.", label)
+            return client
+
+    raise click.ClickException(
+        "No valid RentalReady session found. Log into the owner portal in Chrome/"
+        "Arc/Brave (pms.rentalready.io), then run `rr login`. Or paste a sessionid "
+        "with `rr auth`, or set $RENTALREADY_SESSIONID."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Parsing helpers
+# --------------------------------------------------------------------------- #
+_NULLS = {"", "-", "—", "–", "n/a", "none", "None"}
+
+
+def parse_money(text: str | None) -> float | None:
+    """French money/number -> float. '2 457,02 €' -> 2457.02; '—'/'-' -> None."""
+    if text is None:
+        return None
+    t = text.strip()
+    if t in _NULLS:
+        return None
+    # strip currency, thin/nbsp/regular spaces; French decimal comma -> dot
+    t = (t.replace("€", "").replace("\xa0", "").replace(" ", "")
+          .replace(" ", "").replace(",", "."))
+    if t in _NULLS or t == ".":
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def cells(tr) -> list[str]:
+    return [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+
+
+def mask(value: str | None, keep: int = 4) -> str:
+    """Mask a sensitive string, revealing only the last `keep` chars."""
+    if not value:
+        return ""
+    v = value.replace(" ", "")
+    if keep <= 0 or len(v) <= keep:
+        return "•" * len(v)
+    return "•" * (len(v) - keep) + v[-keep:]
+
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+def emit(data, as_json: bool, render=None) -> None:
+    """Print `data` as JSON, or via `render(data)` for humans."""
+    if as_json:
+        click.echo(jsonlib.dumps(data, indent=2, ensure_ascii=False))
+    elif render is not None:
+        render(data)
+    else:
+        click.echo(jsonlib.dumps(data, indent=2, ensure_ascii=False))
+
+
+def _fmt_eur(v) -> str:
+    return "—" if v is None else f"{v:,.2f} €".replace(",", " ")
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+@click.group(context_settings={"help_option_names": ["-h", "--help"]}, epilog="\b\nExamples:\n  rr overview\n  rr reservations --from 2026-01-01 --to 2026-06-30 --json\n  rr monthly --nights")
+def cli():
+    """Read your RentalReady owner (host space) content from the terminal.
+
+    Acts as the logged-in owner via the browser session cookie. Every read
+    command supports --json for piping into other tools / agents.
+    """
+
+
+@cli.command(epilog="\b\nExamples:\n  rr login")
+def login():
+    """Auto-detect a logged-in browser session and store it (chmod 600)."""
+    seen = 0
+    for label, sid in iter_sessionids():
+        seen += 1
+        client = RentalReady(sid)
+        if client.is_valid():
+            cfg = load_config()
+            cfg["sessionid"] = sid
+            cfg["source"] = label
+            save_config(cfg)
+            client.property_id()  # discover + cache the apartment id
+            log.info("Logged in via %s. Session stored in %s.", label, CONFIG_PATH)
+            return
+    if seen:
+        raise click.ClickException(
+            "Found a RentalReady cookie but it's not a valid session. "
+            "Log into pms.rentalready.io in your browser, then re-run `rr login`."
+        )
+    raise click.ClickException(
+        "No RentalReady session cookie found in any local browser. Log into "
+        "pms.rentalready.io in Chrome/Arc/Brave/Edge first, then re-run `rr login`."
+    )
+
+
+@cli.command(epilog="\b\nExamples:\n  rr auth --sessionid \"$RENTALREADY_SESSIONID\"")
+@click.option("--sessionid", default=None, help="Paste the sessionid cookie value.")
+def auth(sessionid):
+    """Store a sessionid you provide (paste from browser devtools)."""
+    if not sessionid:
+        sessionid = click.prompt("sessionid", hide_input=True)
+    client = RentalReady(sessionid)
+    if not client.is_valid():
+        raise click.ClickException("That sessionid is not a valid owner session.")
+    cfg = load_config()
+    cfg["sessionid"] = sessionid
+    cfg["source"] = "manual"
+    save_config(cfg)
+    client.property_id()
+    log.info("Session stored in %s.", CONFIG_PATH)
+
+
+@cli.command(epilog="\b\nExamples:\n  rr doctor\n  rr doctor --json")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def doctor(as_json):
+    """Diagnose session resolution and connectivity."""
+    found = [l for l, _ in iter_sessionids()]
+    diag = {
+        "env_sessionid": bool(os.environ.get("RENTALREADY_SESSIONID")),
+        "config_path": str(CONFIG_PATH),
+        "config_exists": CONFIG_PATH.exists(),
+        "browser_sessions_found": found,
+        "resolved": False,
+        "source": None,
+        "property_id": None,
+        "error": None,
+    }
+    try:
+        client = get_client()
+        if client.is_valid():  # doctor validates for real, unlike the lazy path
+            diag["resolved"] = True
+            diag["source"] = load_config().get("source")
+            diag["property_id"] = client.property_id()
+        else:
+            diag["error"] = "session found but not valid (expired?)"
+    except click.ClickException as exc:
+        diag["error"] = exc.message
+
+    if as_json:
+        click.echo(jsonlib.dumps(diag, indent=2, ensure_ascii=False))
+    else:
+        log.info("$RENTALREADY_SESSIONID: %s", "set" if diag["env_sessionid"] else "unset")
+        log.info("config: %s (%s)", CONFIG_PATH, "exists" if diag["config_exists"] else "missing")
+        log.info("browser sessions found: %s", found or "none")
+        if diag["resolved"]:
+            log.info("resolve: OK (source=%s)", diag["source"])
+            log.info("property_id: %s", diag["property_id"])
+        else:
+            log.info("resolve: FAILED — %s", diag["error"])
+    if not diag["resolved"]:
+        raise SystemExit(1)
+
+
+@cli.command(epilog="\b\nExamples:\n  rr whoami\n  rr whoami --json")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def whoami(as_json):
+    """Show the logged-in owner and their property."""
+    client = get_client()
+    soup = client.soup("/authentification/host_profile/")
+
+    def field(name):
+        el = soup.select_one(f"[name={name}]")
+        return el.get("value") if el else None
+
+    prop = client.soup("/authentification/host_appartement_details/" + (client.property_id() or "") + "/")
+    title_el = prop.select_one("#detailsRow .gr-body1, #detailsRow .gr-body1-sm")
+    data = {
+        "first_name": field("first_name"),
+        "last_name": field("last_name"),
+        "email": field("email"),
+        "property_id": client.property_id(),
+        "property_name": title_el.get_text(strip=True) if title_el else None,
+    }
+
+    def render(d):
+        name = " ".join(x for x in (d["first_name"], d["last_name"]) if x)
+        click.echo(f"{name} <{d['email']}>")
+        click.echo(f"Property: {d['property_name']} (id {d['property_id']})")
+
+    emit(data, as_json, render)
+
+
+@cli.command(epilog="\b\nExamples:\n  rr profile\n  rr profile --reveal --json")
+@click.option("--reveal", is_flag=True, help="Show IBAN/BIC/phone/DOB in full.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def profile(reveal, as_json):
+    """Owner profile: identity, address, and payout bank details.
+
+    IBAN, BIC, phone and date of birth are masked unless --reveal is given.
+    """
+    client = get_client()
+    soup = client.soup("/authentification/host_profile/")
+    fields = [
+        "first_name", "last_name", "email", "phone", "date_of_birth", "nationality",
+        "address_line1", "address_line2", "post_code", "city", "region",
+        "country_of_residence", "bank_account_iban", "bic", "payout_period",
+    ]
+    data = {}
+    for name in fields:
+        el = soup.select_one(f"[name={name}]")
+        data[name] = el.get("value") if el else None
+    sensitive = {"bank_account_iban": 4, "bic": 0, "phone": 2, "date_of_birth": 0}
+    if not reveal:
+        for name, keep in sensitive.items():
+            if data.get(name):
+                data[name] = mask(data[name], keep)
+
+    def render(d):
+        for k, v in d.items():
+            if v:
+                click.echo(f"{k:24} {v}")
+        if not reveal:
+            click.echo("\n(IBAN/BIC/phone/DOB masked — pass --reveal to show)")
+
+    emit(data, as_json, render)
+
+
+@cli.command(epilog="\b\nExamples:\n  rr overview\n  rr overview --refresh --json")
+@click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def overview(refresh, as_json):
+    """Current-month KPIs: occupancy, net revenue, ADR, current stay."""
+    client = get_client()
+    text = client.soup("/authentification/host_index/",
+                       ttl=DEFAULT_TTL, refresh=refresh).get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text)
+
+    def find(pat, cast=str):
+        m = re.search(pat, text)
+        if not m:
+            return None
+        return cast(m.group(1)) if cast is not str else m.group(1).strip()
+
+    data = {
+        "occupancy_rate_pct": find(r"Taux d'occupation[^%]*?(\d+)\s*%", int),
+        "nights_booked": find(r"(\d+)\s*Nuits? réservées", int),
+        "nights_available": find(r"(\d+)\s*Nuits? disponibles", int),
+        "my_nights": find(r"(\d+)\s*Mes nuits", int),
+        "net_revenue": parse_money(find(r"Revenus nets\s+[\wéû]+\s+\d{4}\s+([\d  ,]+€)")),
+        "adr": parse_money(find(r"([\d  ,]+€)\s*Revenu journalier moyen")),
+        "period": find(r"Taux d'occupation\s+([\wéû]+\s+\d{4})"),
+    }
+    stay = re.search(
+        r"En cours d'hébergement\s+(.+?)\s+(\d+\s+\w+)\s+Check-in\s+(\d+\s+\w+)\s+"
+        r"Check-out\s+(\d+)\s+Nuits?\s+(\d+)\s+Voyageurs?\s+([\d  ,]+€)",
+        text)
+    data["current_stay"] = None if not stay else {
+        "guest": stay.group(1).strip(), "check_in": stay.group(2),
+        "check_out": stay.group(3), "nights": int(stay.group(4)),
+        "travelers": int(stay.group(5)), "net_revenue": parse_money(stay.group(6)),
+    }
+
+    def render(d):
+        click.echo(f"Occupancy {d['period'] or ''}: {d['occupancy_rate_pct']}%"
+                   f"  ({d['nights_booked']} booked / {d['nights_available']} available"
+                   f" / {d['my_nights']} owner)")
+        click.echo(f"Net revenue: {_fmt_eur(d['net_revenue'])}")
+        click.echo(f"Average daily rate: {_fmt_eur(d['adr'])}")
+        s = d["current_stay"]
+        if s:
+            click.echo(f"Now hosting: {s['guest']}  {s['check_in']} → {s['check_out']}"
+                       f"  ({s['nights']}n, {s['travelers']} guests, {_fmt_eur(s['net_revenue'])})")
+
+    emit(data, as_json, render)
+
+
+# Reservations financial-table column order (verified against the live table).
+_RES_COLS = [
+    "id", "start_date", "end_date", "rental_revenue", "commission",
+    "cleaning_revenue", "cleaning_fee", "platform_fee", "payment_fee",
+    "tourist_tax", "net_revenue", "origin", "invoices", "channel_invoices",
+    "expected_payment", "payment_amount", "status",
+]
+_MONEY_COLS = {"rental_revenue", "commission", "cleaning_revenue", "cleaning_fee",
+               "platform_fee", "payment_fee", "tourist_tax", "net_revenue",
+               "expected_payment", "payment_amount"}
+PLATFORMS = {"airbnb": "1", "booking": "4", "hoststay": "2", "host_stay": "2"}
+_TOTAL_COLS = ["period_start", "period_end", "nights", "travelers",
+               "rental_revenue", "commission", "cleaning_revenue", "cleaning_fee",
+               "platform_fee", "payment_fee", "tourist_tax", "net_revenue"]
+
+
+def _parse_reservations_page(soup) -> tuple[list[dict], dict | None, int]:
+    """Parse one reservations page -> (rows, period_totals_or_None, last_page).
+
+    Each reservation is a 17-cell data row followed by a single-cell (colspan)
+    detail row carrying guest/nights/platform; the totals table is period-wide
+    and only meaningful on page 1. `last_page` is the highest number in the
+    pagination nav (1 when unpaginated).
+    """
+    tables = soup.find_all("table")
+    items: list[dict] = []
+    if tables:
+        current = None
+        for tr in tables[0].find_all("tr"):
+            cs = cells(tr)
+            if len(cs) == len(_RES_COLS) and cs[0] != "ID":
+                current = {c: (parse_money(v) if c in _MONEY_COLS else v)
+                           for c, v in zip(_RES_COLS, cs)}
+                items.append(current)
+            elif len(cs) == 1 and current is not None:
+                detail = re.sub(r"\s+", " ", cs[0]).strip()
+                current["detail"] = detail
+                g = re.search(r"Réservation\s*:\s*(.+?)\s+\d+\s+adulte", detail)
+                a = re.search(r"(\d+)\s+adulte", detail)
+                c = re.search(r"(\d+)\s+enfant", detail)
+                n = re.search(r"(\d+)\s+nuit", detail)
+                p = re.search(r"Plateforme\s*:\s*([\w ]+)", detail)
+                current["guest"] = g.group(1).strip() if g else None
+                current["adults"] = int(a.group(1)) if a else None
+                current["children"] = int(c.group(1)) if c else None
+                current["nights"] = int(n.group(1)) if n else None
+                current["platform"] = p.group(1).strip() if p else None
+                current = None
+
+    totals = None
+    if len(tables) > 1:
+        trs = tables[1].find_all("tr")
+        if len(trs) >= 2:
+            totals = {}
+            for col, val in zip(_TOTAL_COLS, cells(trs[1])):
+                if col in ("nights", "travelers"):
+                    totals[col] = int(val) if val.isdigit() else None
+                elif col in ("period_start", "period_end"):
+                    totals[col] = val
+                else:
+                    totals[col] = parse_money(val)
+
+    last_page = 1
+    for a in soup.select("a[href*='page=']"):
+        m = re.search(r"[?&]page=(\d+)", a.get("href", ""))
+        if m:
+            last_page = max(last_page, int(m.group(1)))
+    return items, totals, last_page
+
+
+def collect_reservations(client, params: dict, refresh: bool = False) -> dict:
+    """Fetch every reservation for `params`, following all pages.
+
+    The table paginates at 10 rows/page via ?page=N while the totals row is
+    period-wide. The pagination nav is windowed (it only links the *next* page)
+    and an out-of-range page silently clamps back to page 1 — so the reliable
+    stop is "this page repeats ids we've already seen" (the clamp), which lands
+    exactly one page past the last real one.
+    """
+    items: list[dict] = []
+    totals = None
+    seen: set[str] = set()
+    page = 1
+    while page <= 1000:  # runaway guard
+        soup = client.soup("/host_space/reservations/", {**params, "page": page},
+                           ttl=DEFAULT_TTL, refresh=refresh)
+        page_items, page_totals, _ = _parse_reservations_page(soup)
+        if page == 1:
+            totals = page_totals
+        if not page_items or (page > 1 and page_items[0]["id"] in seen):
+            break  # empty, or clamped back to an already-seen page => past the end
+        items.extend(page_items)
+        seen.update(r["id"] for r in page_items)
+        page += 1
+    return {"period": params, "count": len(items), "pages": page - 1,
+            "reservations": items, "totals": totals}
+
+
+@cli.command(epilog="\b\nExamples:\n  rr reservations --from 2026-01-01 --to 2026-06-30\n  rr reservations --platform airbnb --json")
+@click.option("--from", "start", default=None, metavar="YYYY-MM-DD", help="Period start (default: 1st of this month).")
+@click.option("--to", "end", default=None, metavar="YYYY-MM-DD", help="Period end (default: today).")
+@click.option("--platform", default=None, help="airbnb | booking | hoststay (default: all).")
+@click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def reservations(start, end, platform, refresh, as_json):
+    """Reservations with full financial breakdown + period totals.
+
+    Columns: rental revenue, commission, cleaning, platform/payment fees,
+    tourist tax and net revenue, per reservation and summed for the period.
+    """
+    client = get_client()
+    today = date.today()
+    params = {
+        "start_date": start or today.replace(day=1).isoformat(),
+        "end_date": end or today.isoformat(),
+    }
+    if platform:
+        key = platform.lower().replace(" ", "")
+        if key not in PLATFORMS:
+            raise click.ClickException(f"Unknown platform '{platform}'. Use: airbnb, booking, hoststay.")
+        params["platform"] = PLATFORMS[key]
+
+    data = collect_reservations(client, params, refresh)
+
+    def render(d):
+        click.echo(f"Reservations {d['period']['start_date']} → {d['period']['end_date']}"
+                   f"  ({d['count']} found)\n")
+        for r in d["reservations"]:
+            click.echo(f"  {r['id']}  {r['start_date']}→{r['end_date']}  "
+                       f"{r.get('platform') or r['origin']:<8}  "
+                       f"net {_fmt_eur(r['net_revenue'])}  [{r['status']}]")
+            if r.get("guest"):
+                click.echo(f"       {r['guest']}  {r.get('nights')}n, "
+                           f"{r.get('adults')}ad/{r.get('children')}enf")
+        t = d["totals"]
+        if t:
+            click.echo(f"\n  TOTAL  {t['nights']}n, {t['travelers']} guests   "
+                       f"rental {_fmt_eur(t['rental_revenue'])}   "
+                       f"commission {_fmt_eur(t['commission'])}   "
+                       f"NET {_fmt_eur(t['net_revenue'])}")
+
+    emit(data, as_json, render)
+
+
+_FR_MONTHS = ["", "jan", "fév", "mar", "avr", "mai", "jun",
+              "jul", "aoû", "sep", "oct", "nov", "déc"]
+
+
+def _month_net(client, y: int, m: int, refresh: bool) -> tuple[float, int]:
+    """Portal net revenue + nights for one calendar month.
+
+    Queried as a single-month range so it reproduces exactly the figure the
+    portal shows for that month (e.g. the overview's 'Revenus nets <mois>').
+    """
+    last = calendar.monthrange(y, m)[1]
+    data = collect_reservations(client, {
+        "start_date": f"{y}-{m:02d}-01", "end_date": f"{y}-{m:02d}-{last:02d}",
+    }, refresh)
+    t = data["totals"] or {}
+    return (t.get("net_revenue") or 0.0), (t.get("nights") or 0)
+
+
+def _parse_ddmmyyyy(s: str) -> date:
+    d, m, y = s.split("/")
+    return date(int(y), int(m), int(d))
+
+
+def _collect_monthly(client, today: date, refresh: bool
+                     ) -> tuple[dict[tuple[int, int], dict], date, date]:
+    """Net + nights per (year, month) over the property's whole booking span.
+
+    The span (incl. already-booked future stays) is discovered from one wide
+    pull; each month is then read from the portal's own single-month totals.
+    """
+    wide = collect_reservations(client, {
+        "start_date": today.replace(year=today.year - 2).isoformat(),
+        "end_date": today.replace(year=today.year + 1).isoformat(),
+    }, refresh)
+    starts = [_parse_ddmmyyyy(r["start_date"]) for r in wide["reservations"]]
+    if not starts:
+        raise click.ClickException("No reservations found.")
+    first, last = min(starts), max(starts)
+
+    monthly: dict[tuple[int, int], dict] = {}
+    y, m = first.year, first.month
+    while (y, m) <= (last.year, last.month):
+        net, nights = _month_net(client, y, m, refresh)
+        monthly[(y, m)] = {"net": net, "nights": nights}
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    return monthly, first, last
+
+
+def compute_monthly_table(monthly: dict) -> dict:
+    """Pivot a {(year, month): {net, nights}} map into month rows × year columns.
+
+    A month outside the booking span is None (rendered as a dash), not 0, so
+    "no data yet" stays distinct from "booked but earned nothing". No I/O.
+    """
+    years = sorted({yy for yy, _ in monthly})
+    rows = []
+    for mm in range(1, 13):
+        cells = {}
+        for yy in years:
+            v = monthly.get((yy, mm))
+            cells[str(yy)] = None if v is None else {"net": round(v["net"], 2),
+                                                     "nights": v["nights"]}
+        rows.append({"month": mm, "label": _FR_MONTHS[mm], "years": cells})
+    totals = {
+        str(yy): {"net": round(sum(v["net"] for (y2, _), v in monthly.items() if y2 == yy), 2),
+                  "nights": sum(v["nights"] for (y2, _), v in monthly.items() if y2 == yy)}
+        for yy in years
+    }
+    return {"years": [str(yy) for yy in years], "months": rows, "totals": totals}
+
+
+def compute_projection(monthly: dict, first: date, last: date, today: date,
+                       fill: bool) -> dict:
+    """Pure projection math over a {(year, month): {net, nights}} map.
+
+    For each calendar month, uses the most recent year with data; with `fill`,
+    scales an under-booked latest month up to the best occupancy that month has
+    historically reached. Also computes the naive trailing-12-month sum ending
+    at `today`'s month. No I/O — unit-tested directly.
+    """
+    latest: dict[int, tuple[int, dict]] = {}
+    best_nights: dict[int, int] = {}
+    for (yy, mm), v in monthly.items():
+        if mm not in latest or yy > latest[mm][0]:
+            latest[mm] = (yy, v)
+        best_nights[mm] = max(best_nights.get(mm, 0), v["nights"])
+
+    months_out = []
+    projected_total = 0.0
+    for mm in range(1, 13):
+        if mm not in latest:
+            continue
+        yy, v = latest[mm]
+        net, nights, filled = v["net"], v["nights"], False
+        if fill and nights and best_nights[mm] > nights:
+            net = net / nights * best_nights[mm]
+            nights, filled = best_nights[mm], True
+        projected_total += net
+        months_out.append({"month": mm, "label": _FR_MONTHS[mm], "year_used": yy,
+                           "net": round(net, 2), "nights": nights, "filled": filled})
+
+    naive_total = 0.0
+    ty, tm = today.year, today.month
+    for _ in range(12):
+        v = monthly.get((ty, tm))
+        if v:
+            naive_total += v["net"]
+        tm -= 1
+        if tm == 0:
+            ty, tm = ty - 1, 12
+
+    return {
+        "projected_annual_net": round(projected_total, 2),
+        "naive_trailing_12mo_net": round(naive_total, 2),
+        "uplift": round(projected_total - naive_total, 2),
+        "data_span": {"first": first.isoformat(), "last": last.isoformat()},
+        "months": months_out,
+    }
+
+
+@cli.command(epilog="\b\nExamples:\n  rr monthly\n  rr monthly --nights --json")
+@click.option("--nights", "show_nights", is_flag=True, help="Show booked nights next to each amount.")
+@click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def monthly(show_nights, refresh, as_json):
+    """Net revenue per month: one row per month, one column per year.
+
+    Covers the property's whole booking span, already-booked future stays
+    included, so the current and upcoming months may still be filling.
+    """
+    client = get_client()
+    data = compute_monthly_table(_collect_monthly(client, date.today(), refresh)[0])
+
+    # Wide enough for "13 617.79" and, with --nights, "13 617.79 (247n)".
+    w = 17 if show_nights else 10
+
+    def cell(c):
+        if c is None:
+            return f"{'—':>{w}}"
+        text = f"{c['net']:,.2f}".replace(",", " ")
+        if show_nights:
+            text += f" ({c['nights']}n)"
+        return f"{text:>{w}}"
+
+    def render(d):
+        click.echo("      " + "  ".join(f"{y:>{w}}" for y in d["years"]))
+        for row in d["months"]:
+            click.echo(f"{row['label']:6}" + "  ".join(cell(row["years"][y]) for y in d["years"]))
+        click.echo("-" * (6 + (w + 2) * len(d["years"]) - 2))
+        click.echo(f"{'total':6}" + "  ".join(cell(d["totals"][y]) for y in d["years"]))
+
+    emit(data, as_json, render)
+
+
+@cli.command(epilog="\b\nExamples:\n  rr projection\n  rr projection --fill --json")
+@click.option("--fill", is_flag=True,
+              help="Scale an under-booked latest month up to its best historical occupancy.")
+@click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def projection(fill, refresh, as_json):
+    """Projected annual net revenue, using the latest season for every month.
+
+    A trailing-12-month sum understates a matured year because the property's
+    first season (its earliest months) ran at ramp-up prices. This instead
+    takes, for each of the 12 calendar months, the **most recent year that has
+    data** — so peak months (Jul/Aug) come from the latest season, not the
+    first — and sums them. The naive trailing-12-month figure is reported
+    alongside for comparison.
+
+    With --fill, a month whose latest season is still under-booked versus the
+    best occupancy it has historically reached (e.g. an August not yet fully
+    booked) is scaled from its current nightly rate up to that occupancy — so a
+    peak month in progress isn't undercounted just because bookings are still
+    landing.
+    """
+    client = get_client()
+    today = date.today()
+    monthly, first, last = _collect_monthly(client, today, refresh)
+    data = compute_projection(monthly, first, last, today, fill)
+
+    def render(d):
+        click.echo(f"Yearly revenue projection  (data {d['data_span']['first']} → {d['data_span']['last']})\n")
+        for mo in d["months"]:
+            flag = "  ← filled to best occupancy" if mo.get("filled") else ""
+            click.echo(f"  {mo['label']} {mo['year_used']}   "
+                       f"net {_fmt_eur(mo['net']):>12}   ({mo['nights']}n){flag}")
+        click.echo("  " + "-" * 40)
+        click.echo(f"  PROJECTED ANNUAL NET   {_fmt_eur(d['projected_annual_net'])}")
+        click.echo(f"  naive trailing 12 mo   {_fmt_eur(d['naive_trailing_12mo_net'])}"
+                   f"   (uplift {_fmt_eur(d['uplift'])})")
+
+    emit(data, as_json, render)
+
+
+@cli.command(epilog="\b\nExamples:\n  rr property\n  rr property --json")
+@click.option("--refresh", is_flag=True, help="Bypass the cache and refetch.")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON.")
+def property(refresh, as_json):
+    """Property info sheet: address, status, Wi-Fi, entry codes, parking, etc."""
+    client = get_client()
+    pid = client.property_id()
+    if not pid:
+        raise click.ClickException("Could not determine the property id.")
+    soup = client.soup(f"/authentification/host_appartement_details/{pid}/",
+                       ttl=DEFAULT_TTL, refresh=refresh)
+
+    # Every field renders as a .row with a label div (gr-hint2) + value div (gr-body1).
+    data = {"property_id": pid, "fields": {}}
+    for row in soup.select(".row"):
+        label_el = row.find(class_=re.compile(r"gr-hint2"))
+        value_el = row.find(class_=re.compile(r"gr-body1"))
+        if label_el and value_el:
+            label = label_el.get_text(" ", strip=True)
+            value = value_el.get_text(" ", strip=True)
+            # Skip rating badges and other numeric-only "labels" (nested-row bleed),
+            # empty values, and duplicates.
+            if not label or not value or re.fullmatch(r"[\d.,%]+", label):
+                continue
+            if label == value or label in data["fields"]:
+                continue
+            data["fields"][label] = value
+
+    def render(d):
+        click.echo(f"Property {d['property_id']}")
+        for k, v in d["fields"].items():
+            click.echo(f"  {k:28} {v}")
+
+    emit(data, as_json, render)
+
+
+@cli.command(name="get", epilog="\b\nExamples:\n  rr get /authentification/host_calendars/ --text\n  rr get /authentification/host_feed/")
+@click.argument("path")
+@click.option("--json", "as_json", is_flag=True, help="Parse response as JSON.")
+@click.option("--text", "as_text", is_flag=True, help="Print readable page text instead of raw HTML.")
+def get_cmd(path, as_json, as_text):
+    """Fetch any owner path (escape hatch for calendar, analytics, feed, …).
+
+    Example: rr get /authentification/host_feed/ --text
+    """
+    client = get_client()
+    if not path.startswith("/"):
+        path = "/" + path
+    r = client.get(path)
+    if as_json:
+        click.echo(jsonlib.dumps(r.json(), indent=2, ensure_ascii=False))
+    elif as_text:
+        click.echo(BeautifulSoup(r.text, "lxml").get_text("\n", strip=True))
+    else:
+        click.echo(r.text)
+
+
+
+@cli.command("auth-status", epilog="\b\nExamples:\n  rr auth-status\n  rr auth-status --json")
+@click.option("--json", "as_json", is_flag=True, help="Emit secret-free metadata.")
+def auth_status(as_json):
+    """Report credential storage without contacting the provider. Example: auth-status --json."""
+    import json
+    metadata = _auth_broker("status") or {
+        "connector": "rentalready", "account": "default", "source": "unavailable",
+        "configured": False, "pending": False, "last_sync": None,
+    }
+    if not metadata.get("configured") and CONFIG_PATH.exists():
+        metadata.update(source="legacy", configured=True)
+    metadata.update(session_scope="portable")
+    if CONFIG_PATH.with_suffix(".auth-pending").exists():
+        metadata.update(source="pending-local", configured=True, pending=True)
+    click.echo(json.dumps(metadata))
+
+
+@cli.command("auth-sync", epilog="\b\nExamples:\n  rr auth-sync")
+def auth_sync():
+    """Move stored credentials into 1Password. Example: auth-sync."""
+    import json
+    local_pending = CONFIG_PATH.with_suffix(".auth-pending")
+    metadata = _auth_broker("save", _legacy_config()) if local_pending.exists() else _auth_broker("sync")
+    if metadata and local_pending.exists():
+        local_pending.unlink()
+    if not metadata or not metadata.get("configured"):
+        config = load_config()
+        metadata = _auth_broker("save", config) if config else metadata
+    click.echo(json.dumps(metadata or {"connector": "rentalready", "source": "unavailable", "pending": False}))
+    if not metadata or not metadata.get("configured") or metadata.get("pending"):
+        raise click.exceptions.Exit(3)
+
+
+if __name__ == "__main__":
+    cli()

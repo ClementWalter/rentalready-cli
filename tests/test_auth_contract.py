@@ -1,3 +1,18 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "click==8.3.3",
+#     "requests==2.34.2",
+#     "beautifulsoup4==4.15.0",
+#     "lxml==6.1.3",
+#     "pycryptodome==4.2.0",
+#     "pytest==9.1.1",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
+# ///
 """Credential broker contract tests use synthetic sessions without provider access."""
 import importlib.machinery
 import importlib.util
@@ -10,7 +25,7 @@ from click.testing import CliRunner
 
 @pytest.fixture
 def app(monkeypatch, tmp_path):
-    path = Path(__file__).resolve().parents[1] / "bin/rr"
+    path = Path(__file__).resolve().parents[1] / "rentalready_cli.py"
     loader = importlib.machinery.SourceFileLoader("auth_contract_rentalready", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
@@ -50,3 +65,7 @@ def test_status_never_emits_credentials(app, monkeypatch):
 def test_sync_pending_is_retryable(app, monkeypatch):
     monkeypatch.setattr(app, "_auth_broker", lambda *args: {"configured": True, "pending": True})
     assert CliRunner().invoke(app.cli, ["auth-sync"]).exit_code == 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-q"]))

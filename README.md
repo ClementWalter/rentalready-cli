@@ -1,5 +1,7 @@
 # rentalready-cli
 
+**Visibility: public.**
+
 Lire le contenu **propriétaire (host space)** de RentalReady depuis le terminal —
 détails du logement, indicateurs du mois, et le détail financier des
 réservations — en agissant comme le propriétaire connecté sur
@@ -75,6 +77,6 @@ sont rendus côté client : accessibles via `rr get <path> --text`.
 ## Tests
 
 ```bash
-uv run --with pytest --with click --with requests --with beautifulsoup4 \
-  --with lxml --with pycryptodome python -m pytest tests/ -q
+uv run --script tests/test_rr.py
+uv run --script tests/test_auth_contract.py
 ```

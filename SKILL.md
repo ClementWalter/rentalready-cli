@@ -11,37 +11,17 @@ acting as the logged-in owner against `pms.rentalready.io`.
 
 ## How to invoke
 
-Invoke it as **`rr`** — on `$PATH` via a symlink in `~/.local/bin` onto this
-repo's `bin/rr`, so it always runs the current checkout: a `git pull`, or even
-an uncommitted edit, takes effect immediately with nothing to reinstall.
+Invoke it as **`rr`** — on `$PATH` via `claudine/scripts/link_clis.py`, which
+links this repo's `bin/rr` into `~/.local/bin`, so it always runs the current
+checkout: a `git pull`, or even an uncommitted edit, takes effect immediately
+with nothing to reinstall.
 
 ```bash
 rr overview
 ```
 
-Examples in this doc are written that way. If `rr` is not on `$PATH`, run the
-bundled launcher `bin/rr` resolved against this skill's own directory (PEP 723
-— `uv` resolves deps inline on first run), or link it once:
-
-```bash
-ln -sfn <skill-dir>/bin/rr ~/.local/bin/rr
-```
-
-## Why it reuses the browser session (no login flow)
-
-RentalReady's owner portal is a **server-rendered Django app** protected by a
-**two-factor session login**. There is **no owner-facing JSON API**: the
-`/api/v1/` and `/api/v2/` DRF endpoints exist but are **manager-only** — as the
-owner role they return `403 "Vous n'êtes pas autorisé"`. So the only owner
-surface is the HTML "host space" (`/authentification/host_*` and
-`/host_space/*`).
-
-Rather than re-implement the 2FA login wizard, the CLI authenticates exactly
-like the owner's browser — with the Django **`sessionid` cookie**. It reads that
-cookie **straight from a locally logged-in Chromium browser** (Chrome, Arc,
-Brave, Edge) by decrypting the cookie store with the app's **macOS keychain
-key** (the same approach as `notion-cli`). Nothing to paste; you only log in
-again in the browser when the session expires (~14 days).
+If `rr` is not on `$PATH`, run `<skill-dir>/bin/rr` (a symlink to
+`rentalready_cli.py`, a PEP 723 script — `uv` resolves deps inline on first run).
 
 ## Authentication
 
@@ -65,6 +45,15 @@ chmod-600 in `~/.config/rentalready-cli/config.json` (alongside the discovered
 property id). A command that redirects to `/account/login/` means the session
 expired — log back into `pms.rentalready.io` in your browser and re-run
 `rr login`.
+
+## Output conventions
+
+- Default: compact human-readable text (tables for `reservations`, `monthly`).
+- `--json` on every read command: normalized JSON (amounts as floats in euros;
+  `reservations` adds `count` and `pages`).
+- `rr get <path>` prints the raw HTML (`--text` for readable text, `--json` when
+  the path returns JSON) — the only raw mode.
+- stdout carries data only; logs and progress go to stderr.
 
 ## Commands
 
@@ -124,6 +113,55 @@ text, `--json` if it returns JSON). Use for surfaces without a typed command:
 Diagnose session resolution: env var, stored config, browser sessions found,
 and the resolved property id.
 
+## Recipes
+
+```bash
+# How much did we earn this year, per platform?
+rr reservations --from 2026-01-01 --to 2026-12-31 --platform airbnb --json | jq '.totals'
+rr reservations --from 2026-01-01 --to 2026-12-31 --platform booking --json | jq '.totals'
+
+# Month-by-month net revenue across all years, with nights
+rr monthly --nights
+
+# What will this year bring in, counting an under-booked August at its best occupancy?
+rr projection --fill
+
+# Who is in the flat right now, and how full is this month?
+rr overview
+
+# Wi-Fi password / entry codes for a guest
+rr property --json | jq '.fields | with_entries(select(.key | test("wi-?fi|code"; "i")))'
+```
+
+## Gotchas
+
+- The portal is slow (~4 s/request) and `reservations` paginates at 10
+  rows/page; a cold year-long `reservations` takes ~30 s (warm cache ~0.2 s).
+- A redirect to `/account/login/` means the session expired (~14 days): log back
+  into `pms.rentalready.io` in the browser and re-run `rr login`.
+- The `/api/v*` DRF endpoints answer 403 for the owner role — don't try them.
+- `profile` masks IBAN/BIC/phone/DOB unless `--reveal`; `profile`/`whoami` are
+  never cached because they carry those fields.
+- The **calendar**, **analytics** charts and **guest reviews** are rendered
+client-side (Highcharts / JS), so they aren't parsed into typed output — reach
+them with `rr get <path> --text`, or open the portal in a browser.
+
+## Why it reuses the browser session (no login flow)
+
+RentalReady's owner portal is a **server-rendered Django app** protected by a
+**two-factor session login**. There is **no owner-facing JSON API**: the
+`/api/v1/` and `/api/v2/` DRF endpoints exist but are **manager-only** — as the
+owner role they return `403 "Vous n'êtes pas autorisé"`. So the only owner
+surface is the HTML "host space" (`/authentification/host_*` and
+`/host_space/*`).
+
+Rather than re-implement the 2FA login wizard, the CLI authenticates exactly
+like the owner's browser — with the Django **`sessionid` cookie**. It reads that
+cookie **straight from a locally logged-in Chromium browser** (Chrome, Arc,
+Brave, Edge) by decrypting the cookie store with the app's **macOS keychain
+key** (the same approach as `notion-cli`). Nothing to paste; you only log in
+again in the browser when the session expires (~14 days).
+
 ## Caching
 
 Owner content changes slowly, and the portal is slow (~4 s/request), so
@@ -133,25 +171,21 @@ A warm `reservations` over a year drops from ~30 s to ~0.2 s. Pass `--refresh`
 on any of them to bypass and rewrite the cache. `profile`/`whoami` are **never**
 cached — they carry IBAN/BIC/DOB, which must not touch a plaintext cache.
 
-## What is NOT exposed as a typed command
-
-The **calendar**, **analytics** charts and **guest reviews** are rendered
-client-side (Highcharts / JS), so they aren't parsed into typed output — reach
-them with `rr get <path> --text`, or open the portal in a browser.
-
 ## Tests
 
 ```bash
-uv run --with pytest --with click --with requests --with beautifulsoup4 \
-  --with lxml --with pycryptodome python -m pytest tests/ -q
+uv run --script tests/test_rr.py
+uv run --script tests/test_auth_contract.py
 ```
 
 ## Project layout
 
 ```
 rentalready-cli/
-  SKILL.md            # this file
+  SKILL.md                     # this file
   README.md
-  bin/rr              # PEP 723 launcher — invoke this (session client + parsers)
-  tests/test_rr.py    # unit tests for the pure parsing helpers
+  rentalready_cli.py           # the CLI (PEP 723 script: session client + parsers)
+  bin/rr                       # symlink -> ../rentalready_cli.py — invoke this
+  tests/test_rr.py             # unit tests for the pure parsing helpers
+  tests/test_auth_contract.py  # credential broker contract tests
 ```
