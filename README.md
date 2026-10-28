@@ -91,3 +91,9 @@ sont rendus côté client : accessibles via `rr get <path> --text`.
 uv run --script tests/test_rr.py
 uv run --script tests/test_auth_contract.py
 ```
+
+## Privacy Policy
+
+The Claude Desktop extension built from this repository keeps your data on your
+Mac and talks only to the service it connects to. Full policy:
+<https://clementwalter.github.io/claude-extensions/privacy/>
