@@ -52,8 +52,19 @@ tout. La session est stockée en chmod-600 dans
   première session valide gagne.
 - **`rr auth [--sessionid <valeur>]`** — coller le cookie `sessionid`
   (devtools → Application → Cookies → `pms.rentalready.io` → `sessionid`).
-- Un renvoi vers `/account/login/` = session expirée → reconnecte-toi sur
-  `pms.rentalready.io` puis relance `rr login`.
+- Sans session stockée, chaque commande cherche elle-même une session
+  navigateur ; si la session stockée renvoie vers `/account/login/`, elle
+  réessaie une fois avec une session navigateur plus récente. Sinon la session
+  a expiré partout → reconnecte-toi sur `pms.rentalready.io`, puis réessaie.
+- Seuls les navigateurs dont le magasin de cookies contient une session
+  RentalReady demandent leur clé au trousseau macOS.
+
+## Extension Claude Desktop
+
+`mcpb.json` personnalise l'extension que construit
+`mcp-bridge pack rentalready-cli`, installable d'un double-clic sans terminal :
+se connecter au portail propriétaire dans Chrome, puis cliquer « Toujours
+autoriser » quand macOS demande l'accès au trousseau.
 
 ## Cache
 

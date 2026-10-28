@@ -42,9 +42,12 @@ rr auth --sessionid <value>
 
 `$RENTALREADY_SESSIONID` overrides everything. The resolved session is stored
 chmod-600 in `~/.config/rentalready-cli/config.json` (alongside the discovered
-property id). A command that redirects to `/account/login/` means the session
-expired — log back into `pms.rentalready.io` in your browser and re-run
-`rr login`.
+property id). Any read finds a browser session by itself when none is stored,
+and when the stored one bounces to `/account/login/` it retries once with a
+newer browser session. If that fails too, the session expired everywhere: ask
+the user to log back into `pms.rentalready.io` in their browser, then retry.
+Browsers whose cookie store holds no RentalReady session are never asked for
+their keychain key.
 
 ## Output conventions
 
@@ -138,7 +141,7 @@ rr property --json | jq '.fields | with_entries(select(.key | test("wi-?fi|code"
 - The portal is slow (~4 s/request) and `reservations` paginates at 10
   rows/page; a cold year-long `reservations` takes ~30 s (warm cache ~0.2 s).
 - A redirect to `/account/login/` means the session expired (~14 days): log back
-  into `pms.rentalready.io` in the browser and re-run `rr login`.
+  into `pms.rentalready.io` in the browser, then retry.
 - The `/api/v*` DRF endpoints answer 403 for the owner role — don't try them.
 - `profile` masks IBAN/BIC/phone/DOB unless `--reveal`; `profile`/`whoami` are
   never cached because they carry those fields.

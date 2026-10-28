@@ -76,6 +76,14 @@ COOKIE_SOURCES = [
     ("edge", "~/Library/Application Support/Microsoft Edge/Default/Cookies", "Microsoft Edge Safe Storage"),
 ]
 
+# How to get a session back, for a terminal and for Claude Desktop alike. The
+# keychain prompt is named because denying it looks exactly like being logged out.
+LOGIN_HINT = (
+    "Sign in to the owner portal at https://pms.rentalready.io in Chrome (or "
+    "Arc/Brave/Edge), then try again. If macOS asks to let `security` use the "
+    "browser's \"Safe Storage\" keychain item, click Always Allow."
+)
+
 
 # --------------------------------------------------------------------------- #
 # Cookie extraction (decrypt a Chromium `v10` cookie with the keychain key)
@@ -120,25 +128,35 @@ def iter_sessionids():
         store = Path(path).expanduser()
         if not store.exists():
             continue
+        rows = _session_rows(store)
+        # Only ask the keychain for a store that holds the cookie, so a
+        # signed-out browser never shows a keychain prompt for nothing.
+        if not rows:
+            continue
         key = _keychain_key(service)
         if not key:
             continue
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td) / "Cookies"
-            try:
-                shutil.copy2(store, tmp)  # copy: the live DB is locked by the browser
-                con = sqlite3.connect(f"file:{tmp}?immutable=1", uri=True)
-                rows = con.execute(
-                    "SELECT encrypted_value FROM cookies "
-                    "WHERE host_key LIKE '%rentalready.io' AND name='sessionid'"
-                ).fetchall()
-                con.close()
-            except (OSError, sqlite3.Error):
-                continue
-        for (enc,) in rows:
-            val = _decrypt_cookie(bytes(enc), key)
+        for enc in rows:
+            val = _decrypt_cookie(enc, key)
             if val:
                 yield label, val
+
+
+def _session_rows(store: Path) -> list[bytes]:
+    """Encrypted `sessionid` values for pms.rentalready.io, read from a copy of a live store."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td) / "Cookies"
+        try:
+            shutil.copy2(store, tmp)  # copy: the live DB is locked by the browser
+            con = sqlite3.connect(f"file:{tmp}?immutable=1", uri=True)
+            rows = con.execute(
+                "SELECT encrypted_value FROM cookies "
+                "WHERE host_key LIKE '%rentalready.io' AND name='sessionid'"
+            ).fetchall()
+            con.close()
+        except (OSError, sqlite3.Error):
+            return []
+    return [bytes(enc) for (enc,) in rows]
 
 
 # --------------------------------------------------------------------------- #
@@ -229,19 +247,25 @@ def cache_write(key: str, text: str) -> None:
 class RentalReady:
     """Owner-scoped RentalReady client: session cookie in, parsed content out."""
 
-    def __init__(self, sessionid: str):
+    def __init__(self, sessionid: str, renew=None):
         self.s = requests.Session()
         self.s.headers["User-Agent"] = UA
         self.s.cookies.set("sessionid", sessionid, domain="pms.rentalready.io")
         self._sessionid = sessionid
+        # Called once when the portal bounces to its login page: returns a
+        # newer browser session to retry with, or None.
+        self.renew = renew
 
     def get(self, path: str, params: dict | None = None) -> requests.Response:
         r = self.s.get(BASE + path, params=params, allow_redirects=True, timeout=45)
         if r.url.endswith("/account/login/") or "/account/login/?" in r.url:
-            raise click.ClickException(
-                "Session expired or not logged in. Log into the owner portal in "
-                "your browser (pms.rentalready.io), then re-run `rr login`."
-            )
+            renew, self.renew = self.renew, None
+            fresh = renew() if renew else None
+            if fresh:
+                self.s.cookies.set("sessionid", fresh, domain="pms.rentalready.io")
+                self._sessionid = fresh
+                return self.get(path, params)
+            raise click.ClickException("Your RentalReady session expired. " + LOGIN_HINT)
         return r
 
     def get_text(self, path: str, params: dict | None = None,
@@ -299,25 +323,34 @@ def get_client(require_valid: bool = False) -> RentalReady:
 
     cfg = load_config()
     if cfg.get("sessionid"):
-        client = RentalReady(cfg["sessionid"])
+        stored = cfg["sessionid"]
+        client = RentalReady(stored, renew=lambda: browser_session(exclude=stored))
         if not require_valid or client.is_valid():
             return client
 
-    # Fall back to auto-extraction from a logged-in browser.
+    sid = browser_session()
+    if sid:
+        return RentalReady(sid)
+
+    raise click.ClickException(
+        "No valid RentalReady session found. " + LOGIN_HINT + " From a terminal, "
+        "`rr auth` also takes a pasted sessionid, or set $RENTALREADY_SESSIONID."
+    )
+
+
+def browser_session(exclude: str | None = None) -> str | None:
+    """The first valid session of a logged-in browser, stored for next time."""
     for label, sid in iter_sessionids():
-        client = RentalReady(sid)
-        if client.is_valid():
+        if sid == exclude:
+            continue
+        if RentalReady(sid).is_valid():
+            cfg = load_config()
             cfg["sessionid"] = sid
             cfg["source"] = label
             save_config(cfg)
             log.info("Using session from %s.", label)
-            return client
-
-    raise click.ClickException(
-        "No valid RentalReady session found. Log into the owner portal in Chrome/"
-        "Arc/Brave (pms.rentalready.io), then run `rr login`. Or paste a sessionid "
-        "with `rr auth`, or set $RENTALREADY_SESSIONID."
-    )
+            return sid
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -404,12 +437,10 @@ def login():
             return
     if seen:
         raise click.ClickException(
-            "Found a RentalReady cookie but it's not a valid session. "
-            "Log into pms.rentalready.io in your browser, then re-run `rr login`."
+            "Found a RentalReady cookie but it's not a valid session. " + LOGIN_HINT
         )
     raise click.ClickException(
-        "No RentalReady session cookie found in any local browser. Log into "
-        "pms.rentalready.io in Chrome/Arc/Brave/Edge first, then re-run `rr login`."
+        "No RentalReady session cookie found in any local browser. " + LOGIN_HINT
     )
 
 

@@ -1,0 +1,6 @@
+{
+  "display_name": "RentalReady",
+  "description": "Read your RentalReady owner space from Claude: bookings, revenue, occupancy and property details.",
+  "long_description": "Reads the RentalReady owner portal (pms.rentalready.io) as you: this month's occupancy and net revenue, every reservation with its financial breakdown (rent, commission, cleaning, platform fees, tourist tax), monthly totals, a year-end projection, and your property's details.\n\nSetup:\n1. In Google Chrome (or Arc, Brave, Edge), sign in to https://pms.rentalready.io with your owner account, including the two-factor code.\n2. In Claude, ask: \"how is my RentalReady rental doing this month?\". The first time, macOS asks whether `security` may use the browser's \"Safe Storage\" keychain item: type your Mac password and click Always Allow. This is how the extension reuses your browser session; nothing is sent anywhere else.\n\nThe portal signs you out after about two weeks. When Claude says the session expired, sign in to pms.rentalready.io in Chrome again and ask once more.",
+  "platforms": ["darwin"]
+}
